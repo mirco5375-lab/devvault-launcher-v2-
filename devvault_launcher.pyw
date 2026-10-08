@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import uuid
+import webbrowser
 import zipfile
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -19,7 +20,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 BASE = Path(__file__).parent
 # Dauerhafter Datenordner (unabhängig davon, wo die .pyw liegt oder ob sie ersetzt wird)
 if os.name == "nt":
@@ -1725,6 +1726,7 @@ class App(ctk.CTk):
         self.btn_off = self._cat_button(side, "✔  Offizielle Plugins", self.show_official)
         self.btn_com = self._cat_button(side, "👥  Community", self.show_community)
         self.btn_fb = self._cat_button(side, "💬  Feedback", self.show_feedback)
+        self.btn_info = self._cat_button(side, "ℹ  Informationen", self.show_info)
         ctk.CTkLabel(side, text=f"Version {APP_VERSION}", font=("Segoe UI", 11),
                      text_color=MUTED).pack(side="bottom", pady=16)
         self.show_official()
@@ -1739,7 +1741,7 @@ class App(ctk.CTk):
         return b
 
     def _select(self, active):
-        for b in (self.btn_off, self.btn_com, self.btn_fb):
+        for b in (self.btn_off, self.btn_com, self.btn_fb, self.btn_info):
             b.configure(fg_color=ACCENT if b is active else CARD)
 
     def _clear(self):
@@ -1860,6 +1862,54 @@ class App(ctk.CTk):
                          anchor="w", justify="left", wraplength=520).pack(fill="x", padx=18, pady=(4, 2))
             ctk.CTkLabel(card, text=it.get("date", ""), font=("Segoe UI", 10), text_color="#5d6278",
                          anchor="w").pack(fill="x", padx=18, pady=(0, 12))
+
+    def show_info(self):
+        self._select(self.btn_info)
+        self._clear()
+        self._header("Informationen")
+        page = ctk.CTkScrollableFrame(self.content, fg_color="transparent")
+        page.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        # Hinweis zu Community-Erweiterungen
+        warn = ctk.CTkFrame(page, fg_color=WARN_BG, corner_radius=20)
+        warn.pack(fill="x", padx=6, pady=6)
+        ctk.CTkLabel(warn, text="⚠  Hinweis zu Community-Erweiterungen", font=("Segoe UI", 15, "bold"),
+                     text_color=WARN_FG).pack(anchor="w", padx=18, pady=(14, 4))
+        ctk.CTkLabel(
+            warn,
+            text="Erweiterungen in der Kategorie Community stammen von anderen Nutzern und sind keine "
+                 "offiziellen Erweiterungen vom DevVault-Team. Wir haften nicht für diese Inhalte und "
+                 "unterstützen sie nicht. Die Nutzung erfolgt auf eigene Gefahr.\n\n"
+                 "Offizielle und geprüfte Plugins findest du in der Kategorie Offizielle Plugins.",
+            font=("Segoe UI", 12), text_color=WARN_FG, justify="left", wraplength=520, anchor="w",
+        ).pack(fill="x", padx=18, pady=(0, 14))
+
+        # Soziale Medien
+        ctk.CTkLabel(page, text="Soziale Medien", font=("Segoe UI", 16, "bold"),
+                     text_color=TEXT).pack(anchor="w", padx=10, pady=(16, 4))
+
+        def social_card(icon, name, detail, button_text, command=None):
+            card = ctk.CTkFrame(page, fg_color=CARD, corner_radius=20, height=76)
+            card.pack(fill="x", padx=6, pady=5)
+            card.pack_propagate(False)
+            ctk.CTkLabel(card, text=icon, width=52, height=52, font=("Segoe UI", 22, "bold"), text_color=TEXT,
+                         fg_color="#2a3045", corner_radius=16).pack(side="left", padx=12, pady=12)
+            info = ctk.CTkFrame(card, fg_color="transparent")
+            info.pack(side="left", fill="both", expand=True, pady=10)
+            ctk.CTkLabel(info, text=name, font=("Segoe UI", 15, "bold"), text_color=TEXT, anchor="w").pack(fill="x")
+            ctk.CTkLabel(info, text=detail, font=("Segoe UI", 12), text_color=MUTED, anchor="w").pack(fill="x")
+            if command:
+                ctk.CTkButton(card, text=button_text, width=110, height=40, corner_radius=14, fg_color=ACCENT,
+                              hover_color=ACCENT_HOVER, font=("Segoe UI", 13, "bold"),
+                              command=command).pack(side="right", padx=14)
+            else:
+                ctk.CTkButton(card, text=button_text, width=130, height=40, corner_radius=14, fg_color=CARD,
+                              hover_color=CARD, text_color=MUTED, state="disabled",
+                              font=("Segoe UI", 12)).pack(side="right", padx=14)
+
+        social_card("X", "X", "x.com/DevVault5bjv", "Öffnen",
+                    lambda: webbrowser.open("https://x.com/DevVault5bjv"))
+        social_card("♪", "TikTok", "Bald verfügbar", "Bald verfügbar")
 
     def show_official(self):
         self._select(self.btn_off)
@@ -1985,3 +2035,4 @@ class Splash(ctk.CTkToplevel):
 
 if __name__ == "__main__":
     App().mainloop()
+
