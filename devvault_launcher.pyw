@@ -11,6 +11,11 @@ import io
 import json
 import os
 import shutil
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.request
 import uuid
 import webbrowser
 import zipfile
@@ -20,7 +25,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.4"
 BASE = Path(__file__).parent
 # Dauerhafter Datenordner (unabhängig davon, wo die .pyw liegt oder ob sie ersetzt wird)
 if os.name == "nt":
@@ -31,6 +36,8 @@ OFFICIAL_DIR = DATA_DIR / "official"
 COMMUNITY_DIR = DATA_DIR / "community"
 COMMUNITY_DB = COMMUNITY_DIR / "community.json"
 FEEDBACK_DB = COMMUNITY_DIR / "feedback.json"
+DOWNLOADS_DB = DATA_DIR / "downloads.json"
+MINE_DB = DATA_DIR / "mine.json"
 ICON_PATH = DATA_DIR / "devvault-icon.ico"
 for d in (DATA_DIR, OFFICIAL_DIR, COMMUNITY_DIR):
     d.mkdir(parents=True, exist_ok=True)
@@ -1565,6 +1572,278 @@ WARN_FG = "#ffb84d"
 ctk.set_appearance_mode("dark")
 
 
+# ---- Download-Verlauf ----
+def load_downloads():
+    if DOWNLOADS_DB.exists():
+        try:
+            return json.loads(DOWNLOADS_DB.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def save_downloads(items):
+    DOWNLOADS_DB.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def record_download(name, path, fid=None):
+    items = load_downloads()
+    items.append({"name": name, "path": str(path), "id": fid,
+                  "time": datetime.datetime.now().isoformat(timespec="seconds")})
+    save_downloads(items[-200:])
+
+
+def time_ago(iso):
+    try:
+        secs = (datetime.datetime.now() - datetime.datetime.fromisoformat(iso)).total_seconds()
+    except Exception:
+        return ""
+    m = int(secs // 60)
+    if m < 1:
+        return "gerade eben"
+    if m < 60:
+        return f"vor {m} Minute" + ("n" if m != 1 else "")
+    h = m // 60
+    if h < 24:
+        return f"vor {h} Stunde" + ("n" if h != 1 else "")
+    d = h // 24
+    return f"vor {d} Tag" + ("en" if d != 1 else "")
+
+
+def open_folder(path):
+    folder = Path(path).parent
+    try:
+        if os.name == "nt":
+            os.startfile(str(folder))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(folder)])
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+    except Exception as e:
+        messagebox.showerror("Ordner öffnen fehlgeschlagen", f"{type(e).__name__}: {e}")
+
+
+# ---- Firebase (nur Datenbank-Adresse, KEIN Login/Passwort im Launcher) ----
+# Öffentliche Adresse der DevVault-Datenbank (kein Passwort, kein Schlüssel). Wird beim ersten Start
+# automatisch als firebase.json in den Datenordner gelegt.
+DEFAULT_FIREBASE_URL = "https://devvault-launcher-default-rtdb.europe-west1.firebasedatabase.app"
+
+
+def ensure_firebase_config():
+    cfg = DATA_DIR / "firebase.json"
+    if not cfg.exists():
+        try:
+            cfg.write_text(json.dumps({"databaseURL": DEFAULT_FIREBASE_URL}, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+
+def firebase_url():
+    """Liest nur die öffentliche Datenbank-Adresse aus firebase.json (Benutzerordner oder neben der .pyw)."""
+    for p in (BASE / "firebase.json", DATA_DIR / "firebase.json"):
+        try:
+            if p.exists():
+                u = str(json.loads(p.read_text(encoding="utf-8")).get("databaseURL", "")).strip().rstrip("/")
+                if u.startswith("https://"):
+                    return u
+        except Exception:
+            pass
+    return DEFAULT_FIREBASE_URL
+
+
+def fb_request(method, path, body=None):
+    url = firebase_url()
+    if not url:
+        return None
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(f"{url}/{path}.json", data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=4) as r:
+            return json.loads(r.read().decode("utf-8") or "null")
+    except Exception:
+        return None
+
+
+def fb_id(item):
+    return str(item.get("file", "")).split("_", 1)[0]
+
+
+def fb_count_download(item_id):
+    """Zählt einen Download hoch (im Hintergrund, Fehler werden ignoriert)."""
+    threading.Thread(
+        target=lambda: fb_request("PATCH", f"community/{item_id}", {"downloads": {".sv": {"increment": 1}}}),
+        daemon=True,
+    ).start()
+
+
+def fb_call(method, path, body=None, timeout=6):
+    """Firebase-REST-Aufruf. Gibt (ok, daten, fehlertext) zurück."""
+    url = firebase_url()
+    if not url:
+        return False, None, "Keine firebase.json gefunden"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(f"{url}/{path}.json", data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return True, json.loads(r.read().decode("utf-8") or "null"), None
+    except urllib.error.HTTPError as e:
+        return False, None, ("Zugriff verweigert (Firebase-Regeln prüfen)" if e.code in (401, 403) else f"Fehler {e.code}")
+    except Exception as e:
+        return False, None, f"Keine Verbindung ({type(e).__name__})"
+
+
+# ---- Gemeinsame Community (über Firebase) ----
+ALLOWED_EXT = {".zip", ".crx", ".py", ".js", ".json", ".txt", ".md"}
+MAX_RAW = 1_500_000
+
+
+def load_mine():
+    if MINE_DB.exists():
+        try:
+            return json.loads(MINE_DB.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def save_mine(items):
+    MINE_DB.write_text(json.dumps(items, indent=2), encoding="utf-8")
+
+
+def make_thumb_b64(path):
+    try:
+        im = Image.open(path).convert("RGB")
+        im.thumbnail((80, 80))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=70)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return None
+
+
+def cloud_upload(name, desc, file_path, img_path):
+    """Lädt eine Erweiterung für alle hoch. Gibt (ok, fehlertext, id) zurück."""
+    file_path = Path(file_path)
+    if file_path.suffix.lower() not in ALLOWED_EXT:
+        return False, "Dieser Dateityp ist in der Community nicht erlaubt.\nErlaubt: " + ", ".join(sorted(ALLOWED_EXT)), None
+    if len(file_path.name) > 100:
+        return False, "Der Dateiname ist zu lang (maximal 100 Zeichen).", None
+    raw = file_path.read_bytes()
+    if len(raw) > MAX_RAW:
+        return False, "Die Datei ist zu groß (maximal 1,5 MB).", None
+    iid, token = uuid.uuid4().hex[:12], uuid.uuid4().hex
+    meta = {"name": name[:60], "description": desc[:500], "filename": file_path.name,
+            "created": datetime.datetime.now().isoformat(timespec="seconds"),
+            "verified": False, "blocked": False}
+    thumb = make_thumb_b64(img_path) if img_path else None
+    if thumb:
+        meta["image"] = thumb
+    ok, _, err = fb_call("PATCH", "", {f"items/{iid}": meta,
+                                       f"files/{iid}": base64.b64encode(raw).decode(),
+                                       f"owners/{iid}": token}, timeout=90)
+    if not ok:
+        return False, err, None
+    mine = load_mine()
+    mine.append({"id": iid, "owner": token, "name": name[:60]})
+    save_mine(mine)
+    return True, None, iid
+
+
+def cloud_delete(iid):
+    m = {x["id"]: x for x in load_mine()}.get(iid)
+    if not m:
+        return False, "Das ist nicht deine Erweiterung."
+    ok, _, err = fb_call("PATCH", "", {f"items/{iid}": None, f"files/{iid}": None, f"proof/{iid}": m["owner"]}, timeout=20)
+    fb_call("DELETE", f"proof/{iid}")
+    if ok:
+        save_mine([x for x in load_mine() if x["id"] != iid])
+    return ok, err
+
+
+DEFAULT_REASON = "Der Inhalt hat sich nicht an unsere Richtlinien gehalten."
+
+
+def build_upload_notices(results, mine):
+    """results: [(eigener_eintrag, ok, daten)] -> (hinweise, neue_mine_liste)."""
+    notices, new_mine, handled = [], [], set()
+    for m, ok, data in results:
+        handled.add(m["id"])
+        if not ok:
+            new_mine.append(m)
+            continue
+        if data is None:  # vom Team gelöscht
+            name = m.get("name") or "deine Erweiterung"
+            notices.append(("Deine Erweiterung wurde gelöscht",
+                            f"Deine Erweiterung „{name}“ wurde vom DevVault-Team gelöscht und ist nicht mehr in der "
+                            f"Community verfügbar.\n\nGrund: {DEFAULT_REASON}\n\n"
+                            "Glaubst du, dass das ein Irrtum ist? Melde dich bei uns auf X: @DevVault5bjv"))
+            continue
+        if isinstance(data, dict) and data.get("blocked") is True:
+            name = data.get("name") or m.get("name") or "deine Erweiterung"
+            reason = str(data.get("reason") or DEFAULT_REASON)
+            notices.append(("Deine Erweiterung wurde gesperrt",
+                            f"Deine Erweiterung „{name}“ wurde vom DevVault-Team gesperrt und ist für niemanden mehr "
+                            f"sichtbar oder ladbar.\n\nGrund: {reason}\n\n"
+                            "Glaubst du, dass das ein Irrtum ist? Melde dich bei uns auf X: @DevVault5bjv"))
+            m = dict(m, notified=True)
+        new_mine.append(m)
+    new_mine += [m for m in mine if m["id"] not in handled]
+    return notices, new_mine
+
+
+def upload_error_text(filename, err):
+    reason = "Der Server hat die Datei abgelehnt." if (err and "verweigert" in err) else (err or "Unbekannter Fehler.")
+    return (f"Deine Datei „{filename}“ konnte nicht in unserer Datenbank gespeichert werden.\n\n"
+            f"Grund: {reason}\n\n"
+            "Bitte halte dich an unsere Richtlinien: nur erlaubte Dateitypen (.zip, .crx, .py, .js, .json, .txt, .md), "
+            "höchstens 1,5 MB und keine schädlichen Inhalte.")
+
+
+def visible_cloud_items(items):
+    """Alle Erweiterungen außer gesperrten (blocked), neueste zuerst."""
+    out = [(c, m) for c, m in items.items()
+           if isinstance(m, dict) and m.get("name") and m.get("blocked") is not True]
+    return sorted(out, key=lambda kv: str(kv[1].get("created", "")), reverse=True)
+
+
+def merged_stats(stats_all, cid, meta):
+    """Download-Zahl aus community/, Verifiziert-Haken aus items/ ODER community/."""
+    st = dict(stats_all.get(cid) or {})
+    if meta.get("verified") is True:
+        st["verified"] = True
+    return st
+
+
+def download_cloud(iid, meta):
+    try:
+        ok, data, err = fb_call("GET", f"files/{iid}", timeout=40)
+        if not ok or not isinstance(data, str):
+            if err and "verweigert" in err:
+                messagebox.showerror("Gesperrt", "Diese Erweiterung wurde vom DevVault-Team gesperrt.")
+            else:
+                messagebox.showerror("Download-Fehler", "Die Datei konnte nicht geladen werden.\n" +
+                                     (err or "Vielleicht wurde sie gelöscht."))
+            return
+        raw = base64.b64decode(data)
+        name = meta.get("filename", "download")
+        start = Path.home() / "Downloads"
+        target = filedialog.asksaveasfilename(
+            title="Download speichern unter", initialdir=str(start if start.exists() else Path.home()),
+            initialfile=name, defaultextension=Path(name).suffix)
+        if not target:
+            return
+        Path(target).write_bytes(raw)
+        already = any(h.get("id") == iid for h in load_downloads())
+        record_download(meta.get("name", name), target, iid)
+        if not already:
+            fb_count_download(iid)
+        messagebox.showinfo("Fertig", f"Gespeichert:\n{target}")
+    except Exception as e:
+        messagebox.showerror("Download-Fehler", f"{type(e).__name__}: {e}")
+
+
 def delete_community_item(item):
     """Entfernt eine Community-Erweiterung samt Datei und Bild dauerhaft."""
     for key in ("file", "image"):
@@ -1680,6 +1959,15 @@ class UploadDialog(ctk.CTkToplevel):
             parent=self,
         ):
             return
+        if firebase_url():
+            ok, err, _ = cloud_upload(name, self.desc.get("1.0", "end").strip(), self.file_path, self.img_path)
+            if not ok:
+                messagebox.showerror("Datei nicht gespeichert", upload_error_text(self.file_path.name, err), parent=self)
+                return
+            messagebox.showinfo("Fertig", "Deine Erweiterung ist jetzt für alle in der Community sichtbar.", parent=self)
+            self.on_done()
+            self.destroy()
+            return
         uid = uuid.uuid4().hex[:8]
         stored_file = f"{uid}_{self.file_path.name}"
         shutil.copy(self.file_path, COMMUNITY_DIR / stored_file)
@@ -1711,6 +1999,10 @@ class App(ctk.CTk):
         self.grid_columnconfigure(1, weight=0)
         self.grid_rowconfigure(0, weight=1)
         self._imgs = []
+        self.fb_stats = {}
+        self.cloud_items = {}
+        self.cloud_error = None
+        self._current = None
 
         # Links: Inhalt
         self.content = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=24)
@@ -1733,6 +2025,7 @@ class App(ctk.CTk):
 
         self.withdraw()
         Splash(self, self.deiconify)
+        self.after(3200, self.check_own_uploads)
 
     def _cat_button(self, parent, text, cmd):
         b = ctk.CTkButton(parent, text=text, height=48, corner_radius=16, anchor="w", font=("Segoe UI", 14),
@@ -1741,6 +2034,7 @@ class App(ctk.CTk):
         return b
 
     def _select(self, active):
+        self._current = active
         for b in (self.btn_off, self.btn_com, self.btn_fb, self.btn_info):
             b.configure(fg_color=ACCENT if b is active else CARD)
 
@@ -1755,7 +2049,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(bar, text=title, font=("Segoe UI", 22, "bold"), text_color=TEXT).pack(side="left")
         return bar
 
-    def _card(self, parent, item, folder, filename, on_delete=None):
+    def _card(self, parent, item, folder, filename, on_delete=None, stats=None, image_b64=None, on_download=None):
         card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=20, height=84)
         card.pack(fill="x", padx=6, pady=6)
         card.pack_propagate(False)
@@ -1770,17 +2064,37 @@ class App(ctk.CTk):
                 thumb.configure(image=ci, text="")
             except Exception:
                 pass
+        if image_b64:
+            try:
+                im = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB").resize((60, 60))
+                ci = ctk.CTkImage(im, size=(60, 60))
+                self._imgs.append(ci)
+                thumb.configure(image=ci, text="")
+            except Exception:
+                pass
         thumb.pack(side="left", padx=12, pady=12)
 
         info = ctk.CTkFrame(card, fg_color="transparent")
         info.pack(side="left", fill="both", expand=True, pady=10)
-        ctk.CTkLabel(info, text=item["name"], font=("Segoe UI", 15, "bold"), text_color=TEXT, anchor="w").pack(fill="x")
-        ctk.CTkLabel(info, text=item.get("description", ""), font=("Segoe UI", 12), text_color=MUTED,
+        stats = stats or {}
+        name_row = ctk.CTkFrame(info, fg_color="transparent")
+        name_row.pack(fill="x")
+        ctk.CTkLabel(name_row, text=item["name"], font=("Segoe UI", 15, "bold"), text_color=TEXT,
+                     anchor="w").pack(side="left")
+        if stats.get("verified") is True:
+            ctk.CTkLabel(name_row, text="✓", width=22, height=22, corner_radius=11, fg_color="#4285f4",
+                         text_color="white", font=("Segoe UI", 12, "bold")).pack(side="left", padx=(8, 4))
+            ctk.CTkLabel(name_row, text="Verifiziert", font=("Segoe UI", 11, "bold"),
+                         text_color="#8ab4f8").pack(side="left")
+        desc_txt = item.get("description", "")
+        if isinstance(stats.get("downloads"), int):
+            desc_txt = (desc_txt + "   ·   " if desc_txt else "") + f"{stats['downloads']} Downloads"
+        ctk.CTkLabel(info, text=desc_txt, font=("Segoe UI", 12), text_color=MUTED,
                      anchor="w", justify="left", wraplength=380).pack(fill="x")
 
         ctk.CTkButton(card, text="Download", width=110, height=40, corner_radius=14, fg_color=ACCENT,
                       hover_color=ACCENT_HOVER, font=("Segoe UI", 13, "bold"),
-                      command=lambda: download_file_as(folder / filename, item)).pack(side="right", padx=(6, 14))
+                      command=on_download or (lambda: download_file_as(folder / filename, item))).pack(side="right", padx=(6, 14))
         if on_delete:
             ctk.CTkButton(card, text="🗑", width=44, height=40, corner_radius=14, fg_color="#3a1f26",
                           hover_color="#5a2a35", font=("Segoe UI", 16), command=on_delete).pack(side="right")
@@ -1826,12 +2140,21 @@ class App(ctk.CTk):
             if not t or self.fb_rating == 0 or not d:
                 messagebox.showwarning("Fehlt etwas", "Bitte Titel, Sterne und Beschreibung ausfüllen.")
                 return
+            date = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+            if firebase_url():
+                ok, _, err = fb_call("POST", "feedback", {"title": t[:80], "stars": self.fb_rating,
+                                                          "description": d[:1000], "date": date}, timeout=10)
+                if not ok:
+                    messagebox.showerror("Senden fehlgeschlagen", f"{err}\n\nDein Feedback wurde nicht gesendet.")
+                    return
+                self.show_feedback()
+                return
             items = load_feedback()
             items.append({
                 "title": t,
                 "stars": self.fb_rating,
                 "description": d,
-                "date": datetime.datetime.now().strftime("%d.%m.%Y %H:%M"),
+                "date": date,
             })
             try:
                 save_feedback(items)
@@ -1847,20 +2170,49 @@ class App(ctk.CTk):
         # --- Alle Feedbacks ---
         ctk.CTkLabel(page, text="Alle Feedbacks", font=("Segoe UI", 16, "bold"),
                      text_color=TEXT).pack(anchor="w", padx=10, pady=(14, 4))
-        items = load_feedback()
+        box = ctk.CTkFrame(page, fg_color="transparent")
+        box.pack(fill="x")
+        if firebase_url():
+            ctk.CTkLabel(box, text="Lade Feedbacks …", text_color=MUTED).pack(pady=20)
+
+            def got(r):
+                try:
+                    if not box.winfo_exists():
+                        return
+                except Exception:
+                    return
+                for w in box.winfo_children():
+                    w.destroy()
+                ok, data, err = r
+                if not ok:
+                    ctk.CTkLabel(box, text=f"Feedbacks konnten nicht geladen werden: {err}", text_color=WARN_FG,
+                                 wraplength=480).pack(pady=16)
+                    return
+                items = [data[k] for k in sorted(data, reverse=True)] if isinstance(data, dict) else []
+                self._feedback_cards(box, items)
+
+            self.fetch_async("feedback", got)
+        else:
+            self._feedback_cards(box, list(reversed(load_feedback())))
+
+    def _feedback_cards(self, parent, items):
+        items = [i for i in items if isinstance(i, dict)]
         if not items:
-            ctk.CTkLabel(page, text="Noch kein Feedback vorhanden.", text_color=MUTED).pack(pady=20)
-        for it in reversed(items):
-            card = ctk.CTkFrame(page, fg_color=CARD, corner_radius=20)
+            ctk.CTkLabel(parent, text="Noch kein Feedback vorhanden.", text_color=MUTED).pack(pady=20)
+        for it in items:
+            try:
+                stars = max(0, min(5, int(it.get("stars", 0))))
+            except Exception:
+                stars = 0
+            card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=20)
             card.pack(fill="x", padx=6, pady=5)
             top = ctk.CTkFrame(card, fg_color="transparent")
             top.pack(fill="x", padx=18, pady=(12, 0))
-            ctk.CTkLabel(top, text=it["title"], font=("Segoe UI", 14, "bold"), text_color=TEXT).pack(side="left")
-            ctk.CTkLabel(top, text=stars_text(int(it["stars"])), font=("Segoe UI", 16),
-                         text_color="#ffd166").pack(side="right")
-            ctk.CTkLabel(card, text=it["description"], font=("Segoe UI", 12), text_color=MUTED,
+            ctk.CTkLabel(top, text=str(it.get("title", "")), font=("Segoe UI", 14, "bold"), text_color=TEXT).pack(side="left")
+            ctk.CTkLabel(top, text=stars_text(stars), font=("Segoe UI", 16), text_color="#ffd166").pack(side="right")
+            ctk.CTkLabel(card, text=str(it.get("description", "")), font=("Segoe UI", 12), text_color=MUTED,
                          anchor="w", justify="left", wraplength=520).pack(fill="x", padx=18, pady=(4, 2))
-            ctk.CTkLabel(card, text=it.get("date", ""), font=("Segoe UI", 10), text_color="#5d6278",
+            ctk.CTkLabel(card, text=str(it.get("date", "")), font=("Segoe UI", 10), text_color="#5d6278",
                          anchor="w").pack(fill="x", padx=18, pady=(0, 12))
 
     def show_info(self):
@@ -1911,6 +2263,37 @@ class App(ctk.CTk):
                     lambda: webbrowser.open("https://x.com/DevVault5bjv"))
         social_card("♪", "TikTok", "Bald verfügbar", "Bald verfügbar")
 
+        # Download-Verlauf
+        head = ctk.CTkFrame(page, fg_color="transparent")
+        head.pack(fill="x", padx=10, pady=(20, 4))
+        ctk.CTkLabel(head, text="Download-Verlauf", font=("Segoe UI", 16, "bold"), text_color=TEXT).pack(side="left")
+
+        def clear_history():
+            if messagebox.askyesno("Verlauf leeren", "Den Download-Verlauf wirklich leeren? Deine Dateien bleiben erhalten."):
+                save_downloads([])
+                self.show_info()
+
+        hist = load_downloads()
+        if hist:
+            ctk.CTkButton(head, text="Verlauf leeren", width=120, height=32, corner_radius=12, fg_color=CARD,
+                          hover_color="#2a3045", text_color=MUTED, font=("Segoe UI", 12),
+                          command=clear_history).pack(side="right")
+        if not hist:
+            ctk.CTkLabel(page, text="Noch nichts heruntergeladen.", text_color=MUTED).pack(pady=16)
+        for h in reversed(hist[-30:]):
+            row = ctk.CTkFrame(page, fg_color=CARD, corner_radius=20, height=72)
+            row.pack(fill="x", padx=6, pady=5)
+            row.pack_propagate(False)
+            col = ctk.CTkFrame(row, fg_color="transparent")
+            col.pack(side="left", fill="both", expand=True, padx=16, pady=10)
+            ctk.CTkLabel(col, text=h.get("name", "?"), font=("Segoe UI", 14, "bold"), text_color=TEXT,
+                         anchor="w").pack(fill="x")
+            ctk.CTkLabel(col, text=f"{time_ago(h.get('time', ''))}   ·   {Path(h.get('path', '')).name}",
+                         font=("Segoe UI", 12), text_color=MUTED, anchor="w").pack(fill="x")
+            ctk.CTkButton(row, text="Ordner öffnen", width=120, height=38, corner_radius=14, fg_color=ACCENT,
+                          hover_color=ACCENT_HOVER, font=("Segoe UI", 12, "bold"),
+                          command=lambda pth=h.get("path", ""): open_folder(pth)).pack(side="right", padx=14)
+
     def show_official(self):
         self._select(self.btn_off)
         self._clear()
@@ -1932,7 +2315,94 @@ class App(ctk.CTk):
                 messagebox.showerror("Löschen fehlgeschlagen", f"{type(e).__name__}: {e}")
             self.show_community()
 
-    def show_community(self):
+    def check_own_uploads(self):
+        """Prüft beim Start, ob eigene Uploads vom Team gesperrt oder gelöscht wurden, und warnt einmalig."""
+        if not firebase_url():
+            return
+        todo = [m for m in load_mine() if not m.get("notified")]
+        if not todo:
+            return
+        box = []
+
+        def work():
+            res = []
+            for m in todo:
+                ok, data, _ = fb_call("GET", f"items/{m['id']}", timeout=6)
+                res.append((m, ok, data))
+            box.append(res)
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll(n=0):
+            if box:
+                notices, new_mine = build_upload_notices(box[0], load_mine())
+                if notices:
+                    save_mine(new_mine)
+                    for title, text in notices:
+                        messagebox.showwarning(title, text)
+            elif n < 60:
+                self.after(300, lambda: poll(n + 1))
+
+        poll()
+
+    def fetch_async(self, path, done, timeout=6):
+        """Holt Daten im Hintergrund und ruft done((ok, daten, fehler)) im Hauptfenster auf."""
+        box = []
+        threading.Thread(target=lambda: box.append(fb_call("GET", path, timeout=timeout)), daemon=True).start()
+
+        def poll(n=0):
+            if box:
+                done(box[0])
+            elif n < 70:
+                self.after(150, lambda: poll(n + 1))
+            else:
+                done((False, None, "Zeitüberschreitung"))
+
+        poll()
+
+    def refresh_cloud(self):
+        """Lädt gemeinsame Erweiterungen und Download-Zahlen/Verifiziert-Status."""
+        if not firebase_url():
+            return
+        res = {}
+
+        def got(key):
+            def cb(r):
+                res[key] = r
+                if len(res) == 2:
+                    apply()
+            return cb
+
+        def apply():
+            ok, data, err = res["items"]
+            if ok:
+                self.cloud_items = data if isinstance(data, dict) else {}
+                self.cloud_error = None
+            else:
+                self.cloud_error = err
+            ok2, data2, _ = res["community"]
+            if ok2 and isinstance(data2, dict):
+                self.fb_stats = data2
+            if self._current is self.btn_com:
+                self.show_community(fetch=False)
+
+        self.fetch_async("items", got("items"))
+        self.fetch_async("community", got("community"))
+
+    def confirm_delete_cloud(self, cid, meta):
+        if messagebox.askyesno(
+            "Erweiterung löschen",
+            f"'{meta.get('name', '')}' wirklich löschen?\n\nDanach kann sie niemand mehr aus dem Launcher "
+            "herunterladen. Wer sie schon heruntergeladen hat, behält sie.",
+        ):
+            ok, err = cloud_delete(cid)
+            if not ok:
+                messagebox.showerror("Löschen fehlgeschlagen", str(err))
+            else:
+                self.cloud_items.pop(cid, None)
+            self.show_community()
+
+    def show_community(self, fetch=True):
         self._select(self.btn_com)
         self._clear()
         bar = self._header("Community")
@@ -1945,16 +2415,32 @@ class App(ctk.CTk):
         ctk.CTkLabel(warn, text="⚠  Warnung: Dies ist keine offizielle Erweiterung vom DevVault-Team. "
                                 "Nutzung auf eigene Gefahr.", text_color=WARN_FG, font=("Segoe UI", 12, "bold"),
                      wraplength=560, justify="left").pack(padx=14, pady=10, anchor="w")
+        if self.cloud_error and firebase_url():
+            ctk.CTkLabel(self.content, text=f"Gemeinsame Community nicht erreichbar: {self.cloud_error}",
+                         text_color=MUTED, font=("Segoe UI", 11)).pack(padx=22, anchor="w")
 
         lst = ctk.CTkScrollableFrame(self.content, fg_color="transparent")
         lst.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        items = load_community()
-        if not items:
-            ctk.CTkLabel(lst, text="Noch keine Erweiterungen. Mit + kannst du eine hochladen.",
+        mine = {m["id"] for m in load_mine()}
+        cloud = []
+        if firebase_url():
+            cloud = visible_cloud_items(self.cloud_items)
+        local = load_community()
+        if not cloud and not local:
+            loading = fetch and firebase_url() and not self.cloud_error
+            ctk.CTkLabel(lst, text="Lade Erweiterungen …" if loading else
+                         "Noch keine Erweiterungen. Mit + kannst du eine hochladen.",
                          text_color=MUTED).pack(pady=40)
-        for it in items:
-            self._card(lst, it, COMMUNITY_DIR, it["file"], on_delete=lambda i=it: self.confirm_delete(i))
-
+        for cid, meta in cloud:
+            self._card(lst, {"name": meta["name"], "description": meta.get("description", "")}, COMMUNITY_DIR, "",
+                       on_delete=(lambda c=cid, m=meta: self.confirm_delete_cloud(c, m)) if cid in mine else None,
+                       stats=merged_stats(self.fb_stats, cid, meta), image_b64=meta.get("image"),
+                       on_download=lambda c=cid, m=meta: download_cloud(c, m))
+        for it in local:
+            self._card(lst, it, COMMUNITY_DIR, it["file"], on_delete=lambda i=it: self.confirm_delete(i),
+                       stats=self.fb_stats.get(fb_id(it)))
+        if fetch:
+            self.refresh_cloud()
 
 def download_file_as(src: Path, item):
     try:
@@ -1984,6 +2470,16 @@ def _download(src: Path, item):
     if not target:
         return
     Path(target).write_bytes(data)
+
+    # Verlauf speichern; Community-Downloads einmal pro Erweiterung und PC zählen
+    fid = None if official else fb_id(item)
+    already = bool(fid) and any(h.get("id") == fid for h in load_downloads())
+    try:
+        record_download(item.get("name", name), target, fid)
+    except Exception:
+        pass
+    if fid and not already:
+        fb_count_download(fid)
 
     if official:
         if messagebox.askyesno("Heruntergeladen", f"Gespeichert:\n{target}\n\nJetzt auch entpacken?"):
@@ -2031,6 +2527,9 @@ class Splash(ctk.CTkToplevel):
             self.on_done()
         else:
             self.after(30, self.step)
+
+
+ensure_firebase_config()
 
 
 if __name__ == "__main__":
