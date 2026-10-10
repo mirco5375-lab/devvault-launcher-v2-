@@ -1,6 +1,6 @@
-# DevVault Launcher v2 
+# DevVault Launcher 1.4.1
 
-Moderner Launcher zum Herunterladen der offiziellen DevVault-Erweiterung und von Community-Erweiterungen. Keine Anmeldung nötig.
+DevVault Launcher zum Herunterladen der offiziellen DevVault-Erweiterung und von Community-Erweiterungen. Keine Anmeldung nötig.
 
 ## Starten
 
