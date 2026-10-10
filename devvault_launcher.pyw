@@ -30,7 +30,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFilter
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 BASE = Path(__file__).parent
 # Dauerhafter Datenordner (unabhängig davon, wo die .pyw liegt oder ob sie ersetzt wird)
 if os.name == "nt":
