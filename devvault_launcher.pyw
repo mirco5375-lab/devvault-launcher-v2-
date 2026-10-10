@@ -30,7 +30,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFilter
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 BASE = Path(__file__).parent
 # Dauerhafter Datenordner (unabhängig davon, wo die .pyw liegt oder ob sie ersetzt wird)
 if os.name == "nt":
@@ -1951,6 +1951,32 @@ def delete_community_item(item):
     save_community(items)
 
 
+def mix_hex(c1, c2, t):
+    """Mischt zwei Farben (#rrggbb) zum Anteil t (0 = c1, 1 = c2)."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(int(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def fade_in(win, start=0.0, step=0.12, ms=16):
+    """Blendet ein Fenster weich ein (wo Transparenz unterstützt wird)."""
+    try:
+        win.attributes("-alpha", start)
+    except Exception:
+        return
+
+    def tick(a):
+        a = min(1.0, a + step)
+        try:
+            win.attributes("-alpha", a)
+        except Exception:
+            return
+        if a < 1.0:
+            win.after(ms, lambda: tick(a))
+
+    win.after(ms, lambda: tick(start))
+
+
 def apply_icon(win):
     """Setzt das DevVault-Icon (Windows braucht eine kleine Verzögerung bei CustomTkinter)."""
     def _set():
@@ -2011,6 +2037,7 @@ class UploadDialog(ctk.CTkToplevel):
         self.file_path = None
         self.img_path = None
         self.grab_set()
+        fade_in(self)
 
         ctk.CTkLabel(self, text="Neue Erweiterung", font=("Segoe UI", 20, "bold"), text_color=TEXT).pack(pady=(20, 10))
         self.name = ctk.CTkEntry(self, placeholder_text="Name", width=360, height=40, corner_radius=14)
@@ -2106,15 +2133,27 @@ class App(ctk.CTk):
         side = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=24, width=230)
         side.grid(row=0, column=1, sticky="ns", padx=(8, 16), pady=16)
         side.grid_propagate(False)
-        ctk.CTkLabel(side, text="DevVault", font=("Segoe UI", 24, "bold"), text_color=TEXT).pack(pady=(26, 2))
-        ctk.CTkLabel(side, text="Launcher", font=("Segoe UI", 12), text_color=MUTED).pack(pady=(0, 24))
+        head = ctk.CTkFrame(side, fg_color="transparent")
+        head.pack(fill="x", padx=20, pady=(26, 0))
+        self._side_logo = ctk.CTkImage(
+            Image.open(io.BytesIO(base64.b64decode("".join(LOGO_PNG_B64)))), size=(44, 44))
+        ctk.CTkLabel(head, text="", image=self._side_logo).pack(side="left")
+        names = ctk.CTkFrame(head, fg_color="transparent")
+        names.pack(side="left", padx=(12, 0))
+        ctk.CTkLabel(names, text="DevVault", font=("Segoe UI", 20, "bold"), text_color=TEXT,
+                     anchor="w").pack(anchor="w")
+        ctk.CTkLabel(names, text="Launcher", font=("Segoe UI", 12), text_color=MUTED,
+                     anchor="w").pack(anchor="w")
+        ctk.CTkFrame(side, height=1, fg_color="#2a3045").pack(fill="x", padx=20, pady=(18, 14))
 
         self.btn_off = self._cat_button(side, "✔  Offizielle Plugins", self.show_official)
         self.btn_com = self._cat_button(side, "👥  Community", self.show_community)
         self.btn_fb = self._cat_button(side, "💬  Feedback", self.show_feedback)
         self.btn_info = self._cat_button(side, "ℹ  Informationen", self.show_info)
-        ctk.CTkLabel(side, text=f"Version {APP_VERSION}", font=("Segoe UI", 11),
-                     text_color=MUTED).pack(side="bottom", pady=16)
+        foot = ctk.CTkFrame(side, fg_color="transparent")
+        foot.pack(side="bottom", fill="x", pady=(0, 16))
+        ctk.CTkFrame(foot, height=1, fg_color="#2a3045").pack(fill="x", padx=20, pady=(0, 12))
+        ctk.CTkLabel(foot, text=f"Version {APP_VERSION}", font=("Segoe UI", 11), text_color=MUTED).pack()
         self.show_official()
 
         self.withdraw()
@@ -2124,15 +2163,81 @@ class App(ctk.CTk):
         self.after(3200, self.check_own_uploads)
 
     def _cat_button(self, parent, text, cmd):
-        b = ctk.CTkButton(parent, text=text, height=48, corner_radius=16, anchor="w", font=("Segoe UI", 14),
-                          fg_color=CARD, hover_color="#2a3045", text_color=TEXT, command=cmd)
-        b.pack(fill="x", padx=16, pady=6)
+        b = ctk.CTkButton(parent, text="  " + text, height=46, corner_radius=16, anchor="w",
+                          font=("Segoe UI", 14), fg_color="transparent", hover_color="#262b3d",
+                          text_color=MUTED, command=cmd)
+        b.pack(fill="x", padx=14, pady=3)
         return b
 
+    def _fade_btn(self, btn, c1, c2, final, steps=7, ms=18):
+        """Färbt einen Knopf weich von c1 nach c2 um."""
+        btn._tw = getattr(btn, "_tw", 0) + 1
+        tok = btn._tw
+
+        def step(i):
+            if btn._tw != tok:
+                return
+            try:
+                if i >= steps:
+                    btn.configure(fg_color=final)
+                    return
+                btn.configure(fg_color=mix_hex(c1, c2, i / steps))
+                btn.after(ms, lambda: step(i + 1))
+            except Exception:
+                pass
+
+        step(0)
+
     def _select(self, active):
+        prev = self._current
         self._current = active
         for b in (self.btn_off, self.btn_com, self.btn_fb, self.btn_info):
-            b.configure(fg_color=ACCENT if b is active else CARD)
+            on = b is active
+            b.configure(text_color=TEXT if on else MUTED, hover_color=ACCENT_HOVER if on else "#262b3d")
+            if on:
+                if b is prev:
+                    b.configure(fg_color=ACCENT)
+                else:
+                    self._fade_btn(b, PANEL, ACCENT, ACCENT)
+            elif b is prev:
+                self._fade_btn(b, ACCENT, PANEL, "transparent")
+            else:
+                b.configure(fg_color="transparent")
+
+    def cascade(self, container, step=50, limit=10):
+        """Blendet die Einträge einer Liste nacheinander ein (die ersten 'limit' mit Verzögerung)."""
+        try:
+            kids = list(container.winfo_children())
+        except Exception:
+            return
+        infos = []
+        for w in kids:
+            try:
+                info = w.pack_info()
+                info.pop("in", None)
+                infos.append((w, info))
+            except Exception:
+                continue
+        for w, _ in infos:
+            try:
+                w.pack_forget()
+            except Exception:
+                pass
+
+        def reveal(i=0):
+            while i < len(infos):
+                w, info = infos[i]
+                try:
+                    if w.winfo_exists():
+                        w.pack(**info)
+                except Exception:
+                    pass
+                i += 1
+                if i <= limit:
+                    self.after(step, lambda n=i: reveal(n))
+                    return
+
+        reveal()
 
     def _clear(self):
         for w in self.content.winfo_children():
@@ -2290,6 +2395,7 @@ class App(ctk.CTk):
             self.fetch_async("feedback", got)
         else:
             self._feedback_cards(box, list(reversed(load_feedback())))
+        self.cascade(page)
 
     def _feedback_cards(self, parent, items):
         items = [i for i in items if isinstance(i, dict)]
@@ -2401,6 +2507,7 @@ class App(ctk.CTk):
             ctk.CTkButton(row, text="Ordner öffnen", width=120, height=38, corner_radius=14, fg_color=ACCENT,
                           hover_color=ACCENT_HOVER, font=("Segoe UI", 12, "bold"),
                           command=lambda pth=h.get("path", ""): open_folder(pth)).pack(side="right", padx=14)
+        self.cascade(page)
 
     def show_official(self):
         self._select(self.btn_off)
@@ -2410,6 +2517,7 @@ class App(ctk.CTk):
         lst.pack(fill="both", expand=True, padx=16, pady=(0, 16))
         for it in OFFICIAL:
             self._card(lst, it, OFFICIAL_DIR, it["file"])
+        self.cascade(lst)
 
     def confirm_delete(self, item):
         if messagebox.askyesno(
@@ -2479,7 +2587,12 @@ class App(ctk.CTk):
         if info:
             UpdateWindow(self, info, mandatory=True)
         else:
+            try:
+                self.attributes("-alpha", 0.0)
+            except Exception:
+                pass
             self.deiconify()
+            fade_in(self)
 
     def offer_update(self, info):
         UpdateWindow(self, info, mandatory=False)
@@ -2579,6 +2692,7 @@ class App(ctk.CTk):
             self._card(lst, it, COMMUNITY_DIR, it["file"], on_delete=lambda i=it: self.confirm_delete(i),
                        stats=self.fb_stats.get(fb_id(it)))
         if fetch:
+            self.cascade(lst)
             self.refresh_cloud()
 
 def download_file_as(src: Path, item):
@@ -2773,6 +2887,7 @@ class UpdateWindow(ctk.CTkToplevel):
 
         threading.Thread(target=self._get_size, daemon=True).start()
         self.after(200, self._poll_size)
+        fade_in(self)
 
     def _get_size(self):
         url = str(self.info.get("url", ""))
