@@ -30,7 +30,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFilter
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.4.1"
 BASE = Path(__file__).parent
 # Dauerhafter Datenordner (unabhängig davon, wo die .pyw liegt oder ob sie ersetzt wird)
 if os.name == "nt":
@@ -1832,30 +1832,14 @@ def install_update(data, info):
     return m.group(1)
 
 
-def apply_update(info, progress=None):
-    """Lädt das Update herunter (mit Fortschritt 0..1 über progress) und installiert es."""
+def apply_update(info):
     url = str(info.get("url", "")).strip()
     if not url.startswith("https://"):
         raise ValueError("Die Update-Adresse fehlt oder ist ungültig.")
     req = urllib.request.Request(url, headers={"User-Agent": "DevVaultLauncher"})
     with urllib.request.urlopen(req, timeout=30) as r:
-        total = int(r.headers.get("Content-Length") or 0)
-        buf = bytearray()
-        while True:
-            chunk = r.read(16384)
-            if not chunk:
-                break
-            buf += chunk
-            if len(buf) > 5_000_000:
-                raise ValueError("Die Update-Datei ist unerwartet groß.")
-            if progress:
-                progress(min(0.95, len(buf) / total) if total else None)
-    if progress:
-        progress(0.97)
-    new = install_update(bytes(buf), info)
-    if progress:
-        progress(1.0)
-    return new
+        data = r.read(5_000_001)
+    return install_update(data, info)
 
 
 def visible_cloud_items(items):
@@ -2081,21 +2065,8 @@ class App(ctk.CTk):
         self.show_official()
 
         self.withdraw()
-        Splash(self, self.startup_update_check)
-
-    def startup_update_check(self):
-        """Nach dem Splash: Ist laut Firebase eine neuere Version nötig, wird der Launcher nicht geladen."""
-        def done(r):
-            ok, data, _ = r
-            info = data if isinstance(data, dict) else {}
-            latest = str(info.get("version", ""))
-            if ok and latest and parse_version(latest) > parse_version(APP_VERSION):
-                UpdateGate(self, info)  # Launcher bleibt versteckt, bis aktualisiert wurde
-                return
-            self.deiconify()
-            self.after(3000, self.check_own_uploads)
-
-        self.fetch_async("app", done)
+        Splash(self, lambda: (self.deiconify(), self.after(800, self.check_updates)))
+        self.after(3200, self.check_own_uploads)
 
     def _cat_button(self, parent, text, cmd):
         b = ctk.CTkButton(parent, text=text, height=48, corner_radius=16, anchor="w", font=("Segoe UI", 14),
@@ -2610,126 +2581,6 @@ def _download(src: Path, item):
             )
     else:
         messagebox.showinfo("Fertig", f"Gespeichert:\n{target}")
-
-
-class UpdateGate(ctk.CTkToplevel):
-    """Pflicht-Update: fester Rahmen ohne Titelleiste (nicht verschiebbar). Erst nach dem Update startet der Launcher."""
-
-    W, H = 520, 380
-    TRANSPARENT = "#010203"
-
-    def __init__(self, master, info):
-        super().__init__(master, fg_color=self.TRANSPARENT)
-        self.app = master
-        self.info = info
-        self.state_box = {"p": 0.0, "done": None, "err": None}
-        self.overrideredirect(True)  # keine Titelleiste -> Fenster lässt sich nicht bewegen
-        try:
-            self.attributes("-transparentcolor", self.TRANSPARENT)
-        except Exception:
-            pass
-        x = (self.winfo_screenwidth() - self.W) // 2
-        y = (self.winfo_screenheight() - self.H) // 2
-        self.geometry(f"{self.W}x{self.H}+{x}+{y}")
-        try:
-            self.attributes("-topmost", True)
-        except Exception:
-            pass
-
-        card = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=32, border_width=2, border_color="#2a3045")
-        card.pack(fill="both", expand=True)
-        try:
-            logo = Image.open(io.BytesIO(base64.b64decode("".join(LOGO_PNG_B64)))).convert("RGBA")
-            self._logo = ctk.CTkImage(logo, size=(84, 84))
-            ctk.CTkLabel(card, text="", image=self._logo).pack(pady=(26, 0))
-        except Exception:
-            pass
-        ctk.CTkLabel(card, text="Update erforderlich", font=("Segoe UI", 26, "bold"),
-                     text_color=TEXT).pack(pady=(6, 4))
-        ctk.CTkLabel(
-            card, justify="center", wraplength=420, font=("Segoe UI", 13), text_color=MUTED,
-            text=f"Das Update auf Version {info.get('version')} muss heruntergeladen werden, "
-                 f"damit du die neuesten Funktionen und Verbesserungen bekommst.\n"
-                 f"Deine Version: {APP_VERSION}",
-        ).pack(pady=(0, 14))
-        notes = str(info.get("notes", "")).strip()
-        if notes:
-            ctk.CTkLabel(card, text=notes[:200], justify="center", wraplength=420, font=("Segoe UI", 12),
-                         text_color="#5d6278").pack(pady=(0, 10))
-
-        self.bar = ctk.CTkProgressBar(card, width=340, height=8, corner_radius=4, progress_color=ACCENT,
-                                      fg_color=CARD)
-        self.bar.set(0)
-        self.status = ctk.CTkLabel(card, text="", font=("Segoe UI", 12), text_color=MUTED)
-        self.start_btn = ctk.CTkButton(card, text="Start", width=200, height=46, corner_radius=16,
-                                       fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                                       font=("Segoe UI", 15, "bold"), command=self.start)
-        self.start_btn.pack(pady=(4, 6))
-        self.quit_btn = ctk.CTkButton(card, text="Beenden", width=100, height=28, corner_radius=10,
-                                      fg_color="transparent", hover_color=CARD, text_color=MUTED,
-                                      font=("Segoe UI", 11), command=self.quit_app)
-        self.quit_btn.pack(side="bottom", pady=14)
-        self.bar_shown = False
-        try:
-            self.grab_set()
-        except Exception:
-            pass
-
-    def quit_app(self):
-        try:
-            self.app.destroy()
-        except Exception:
-            pass
-
-    def start(self):
-        self.start_btn.configure(state="disabled", text="Lade herunter …")
-        self.quit_btn.configure(state="disabled")
-        self.bar.pack(pady=(10, 0))
-        self.status.pack(pady=(8, 0))
-        box = self.state_box
-
-        def prog(p):
-            box["p"] = p
-
-        def work():
-            try:
-                box["done"] = apply_update(self.info, prog)
-            except Exception as e:
-                box["err"] = f"{type(e).__name__}: {e}"
-
-        threading.Thread(target=work, daemon=True).start()
-        self.poll()
-
-    def poll(self):
-        box = self.state_box
-        p = box["p"]
-        if p is None:  # Dateigröße unbekannt -> sanft pendeln
-            self.bar.set((time.time() % 2) / 2)
-            self.status.configure(text="Lade herunter …")
-        else:
-            self.bar.set(p)
-            self.status.configure(text=f"{int(p * 100)} %")
-        if box["err"]:
-            messagebox.showerror("Update fehlgeschlagen", box["err"], parent=self)
-            box["err"] = None
-            box["p"] = 0.0
-            self.bar.pack_forget()
-            self.status.pack_forget()
-            self.start_btn.configure(state="normal", text="Erneut versuchen")
-            self.quit_btn.configure(state="normal")
-            return
-        if box["done"]:
-            self.bar.set(1.0)
-            self.status.configure(text="Fertig – Launcher startet neu …")
-            self.after(900, self.restart)
-            return
-        self.after(60, self.poll)
-
-    def restart(self):
-        try:
-            subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
-        finally:
-            self.app.destroy()
 
 
 SPLASH_FRAMES = 24
