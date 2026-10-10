@@ -5,11 +5,16 @@ Start:  pip install customtkinter pillow   ->   python devvault_launcher.py
 Alle Daten (Community-Uploads, Feedbacks) werden dauerhaft im Benutzerordner gespeichert:
   Windows: %APPDATA%\\DevVaultLauncher      sonst: ~/.devvault-launcher
 """
+import ast
 import base64
 import datetime
+import hashlib
 import io
+import math
+import time
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,9 +28,9 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.4.1"
 BASE = Path(__file__).parent
 # Dauerhafter Datenordner (unabhängig davon, wo die .pyw liegt oder ob sie ersetzt wird)
 if os.name == "nt":
@@ -1801,6 +1806,42 @@ def upload_error_text(filename, err):
             "höchstens 1,5 MB und keine schädlichen Inhalte.")
 
 
+# ---- Automatische Updates ----
+def parse_version(v):
+    nums = re.findall(r"\d+", str(v))
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
+def install_update(data, info):
+    """Prüft die heruntergeladene Datei und ersetzt damit den Launcher. Gibt die neue Version zurück."""
+    if len(data) > 5_000_000:
+        raise ValueError("Die Update-Datei ist unerwartet groß.")
+    sha = str(info.get("sha256", "")).strip().lower()
+    if sha and hashlib.sha256(data).hexdigest().lower() != sha:
+        raise ValueError("Die Prüfsumme stimmt nicht. Update abgebrochen.")
+    text = data.decode("utf-8")
+    ast.parse(text)  # muss gültiger Python-Code sein
+    m = re.search(r'^APP_VERSION = "([^"]+)"', text, re.M)
+    if not m or parse_version(m.group(1)) <= parse_version(APP_VERSION):
+        raise ValueError("Die heruntergeladene Datei ist keine neuere Version.")
+    me = Path(__file__).resolve()
+    shutil.copy2(me, me.with_name(me.name + ".bak"))
+    tmp = me.with_name(me.name + ".new")
+    tmp.write_bytes(data)
+    os.replace(tmp, me)
+    return m.group(1)
+
+
+def apply_update(info):
+    url = str(info.get("url", "")).strip()
+    if not url.startswith("https://"):
+        raise ValueError("Die Update-Adresse fehlt oder ist ungültig.")
+    req = urllib.request.Request(url, headers={"User-Agent": "DevVaultLauncher"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = r.read(5_000_001)
+    return install_update(data, info)
+
+
 def visible_cloud_items(items):
     """Alle Erweiterungen außer gesperrten (blocked), neueste zuerst."""
     out = [(c, m) for c, m in items.items()
@@ -2024,7 +2065,7 @@ class App(ctk.CTk):
         self.show_official()
 
         self.withdraw()
-        Splash(self, self.deiconify)
+        Splash(self, lambda: (self.deiconify(), self.after(800, self.check_updates)))
         self.after(3200, self.check_own_uploads)
 
     def _cat_button(self, parent, text, cmd):
@@ -2263,6 +2304,18 @@ class App(ctk.CTk):
                     lambda: webbrowser.open("https://x.com/DevVault5bjv"))
         social_card("♪", "TikTok", "Bald verfügbar", "Bald verfügbar")
 
+        # Updates
+        ctk.CTkLabel(page, text="Updates", font=("Segoe UI", 16, "bold"),
+                     text_color=TEXT).pack(anchor="w", padx=10, pady=(20, 4))
+        upd = ctk.CTkFrame(page, fg_color=CARD, corner_radius=20, height=72)
+        upd.pack(fill="x", padx=6, pady=5)
+        upd.pack_propagate(False)
+        ctk.CTkLabel(upd, text=f"Deine Version: {APP_VERSION}", font=("Segoe UI", 14, "bold"),
+                     text_color=TEXT).pack(side="left", padx=18)
+        ctk.CTkButton(upd, text="Nach Updates suchen", width=170, height=38, corner_radius=14, fg_color=ACCENT,
+                      hover_color=ACCENT_HOVER, font=("Segoe UI", 12, "bold"),
+                      command=lambda: self.check_updates(manual=True)).pack(side="right", padx=14)
+
         # Download-Verlauf
         head = ctk.CTkFrame(page, fg_color="transparent")
         head.pack(fill="x", padx=10, pady=(20, 4))
@@ -2344,6 +2397,41 @@ class App(ctk.CTk):
                 self.after(300, lambda: poll(n + 1))
 
         poll()
+
+    def check_updates(self, manual=False):
+        """Sucht beim Start (und auf Wunsch) nach einer neueren Version."""
+        def done(r):
+            ok, data, err = r
+            if not ok:
+                if manual:
+                    messagebox.showwarning("Update-Prüfung", f"Konnte nicht prüfen: {err}")
+                return
+            info = data if isinstance(data, dict) else {}
+            latest = str(info.get("version", ""))
+            if latest and parse_version(latest) > parse_version(APP_VERSION):
+                self.offer_update(info)
+            elif manual:
+                messagebox.showinfo("Updates", f"Du hast die neueste Version ({APP_VERSION}).")
+
+        self.fetch_async("app", done)
+
+    def offer_update(self, info):
+        msg = f"Neue Version {info.get('version')} ist verfügbar (du hast {APP_VERSION})."
+        notes = str(info.get("notes", "")).strip()
+        if notes:
+            msg += f"\n\n{notes}"
+        if not messagebox.askyesno("Update verfügbar", msg + "\n\nJetzt aktualisieren?"):
+            return
+        try:
+            new = apply_update(info)
+        except Exception as e:
+            messagebox.showerror("Update fehlgeschlagen", f"{type(e).__name__}: {e}")
+            return
+        messagebox.showinfo("Fertig", f"Aktualisiert auf Version {new}. Der Launcher startet jetzt neu.")
+        try:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
+        finally:
+            self.destroy()
 
     def fetch_async(self, path, done, timeout=6):
         """Holt Daten im Hintergrund und ruft done((ok, daten, fehler)) im Hauptfenster auf."""
@@ -2495,38 +2583,89 @@ def _download(src: Path, item):
         messagebox.showinfo("Fertig", f"Gespeichert:\n{target}")
 
 
+SPLASH_FRAMES = 24
+
+
+def make_splash_frames(logo_img, bg=(23, 26, 35)):
+    """Vorberechnete Bilder: Logo, das sanft pulsiert und leuchtet."""
+    frames = []
+    base = logo_img.convert("RGBA")
+    for i in range(SPLASH_FRAMES):
+        ph = math.sin(i / SPLASH_FRAMES * 2 * math.pi)
+        size = int(92 * (1 + 0.045 * ph))
+        canvas = Image.new("RGBA", (170, 170), bg + (255,))
+        glow = Image.new("RGBA", (170, 170), (0, 0, 0, 0))
+        ImageDraw.Draw(glow).ellipse((32, 32, 138, 138), fill=(108, 92, 231, int(85 + 45 * ph)))
+        canvas.alpha_composite(glow.filter(ImageFilter.GaussianBlur(20)))
+        lg = base.resize((size, size), Image.LANCZOS)
+        canvas.alpha_composite(lg, ((170 - size) // 2, (170 - size) // 2))
+        frames.append(canvas)
+    return frames
+
+
 class Splash(ctk.CTkToplevel):
-    """Ladebildschirm beim Start (ohne Rahmen, abgerundet)."""
+    """Ladebildschirm: abgerundet, weich ein- und ausgeblendet, pulsierendes Logo."""
+
+    W, H, DURATION = 520, 380, 2.4
+    TRANSPARENT = "#010203"
+    STATUS = [(0.0, "Starte DevVault"), (0.4, "Lade Oberfläche"), (0.8, "Gleich geht's los")]
 
     def __init__(self, master, on_done):
-        super().__init__(master, fg_color=PANEL)
+        super().__init__(master, fg_color=self.TRANSPARENT)
         self.on_done = on_done
         self.overrideredirect(True)
-        w, h = 420, 340
-        x = (self.winfo_screenwidth() - w) // 2
-        y = (self.winfo_screenheight() - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
-        self.attributes("-topmost", True)
-        _logo = ctk.CTkImage(Image.open(io.BytesIO(base64.b64decode("".join(LOGO_PNG_B64)))), size=(96, 96))
-        self._logo = _logo
-        ctk.CTkLabel(self, text="", image=_logo).pack(pady=(36, 0))
-        ctk.CTkLabel(self, text="DevVault", font=("Segoe UI", 34, "bold"), text_color=TEXT).pack(pady=(6, 0))
-        ctk.CTkLabel(self, text="Launcher wird geladen …", font=("Segoe UI", 13), text_color=MUTED).pack(pady=(4, 24))
-        self.bar = ctk.CTkProgressBar(self, width=300, height=10, corner_radius=8,
-                                      progress_color=ACCENT, fg_color=CARD)
+        try:
+            self.attributes("-transparentcolor", self.TRANSPARENT)  # runde Ecken (Windows)
+        except Exception:
+            pass
+        x = (self.winfo_screenwidth() - self.W) // 2
+        y = (self.winfo_screenheight() - self.H) // 2
+        self.geometry(f"{self.W}x{self.H}+{x}+{y}")
+        try:
+            self.attributes("-topmost", True)
+            self.attributes("-alpha", 0.0)
+        except Exception:
+            pass
+
+        card = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=32, border_width=2, border_color="#2a3045")
+        card.pack(fill="both", expand=True)
+
+        logo = Image.open(io.BytesIO(base64.b64decode("".join(LOGO_PNG_B64))))
+        self._frames = [ctk.CTkImage(f, size=(170, 170)) for f in make_splash_frames(logo)]
+        self.logo_label = ctk.CTkLabel(card, text="", image=self._frames[0])
+        self.logo_label.pack(pady=(30, 0))
+        ctk.CTkLabel(card, text="DevVault Launcher", font=("Segoe UI", 30, "bold"), text_color=TEXT).pack(pady=(0, 2))
+        ctk.CTkLabel(card, text="Teile deine Ideen mit der Community", font=("Segoe UI", 13),
+                     text_color=MUTED).pack(pady=(0, 22))
+        self.bar = ctk.CTkProgressBar(card, width=320, height=8, corner_radius=4, progress_color=ACCENT,
+                                      fg_color=CARD)
         self.bar.pack()
         self.bar.set(0)
-        self.value = 0.0
+        self.status = ctk.CTkLabel(card, text=self.STATUS[0][1], font=("Segoe UI", 12), text_color=MUTED)
+        self.status.pack(pady=(10, 0))
+        ctk.CTkLabel(card, text=f"Version {APP_VERSION}", font=("Segoe UI", 10),
+                     text_color="#5d6278").pack(side="bottom", pady=14)
+        self.t0 = time.time()
         self.step()
 
     def step(self):
-        self.value += 0.02
-        self.bar.set(min(self.value, 1))
-        if self.value >= 1:
+        e = time.time() - self.t0
+        p = min(e / self.DURATION, 1.0)
+        self.bar.set(p * p * (3 - 2 * p))  # weich beschleunigen und abbremsen
+        self.logo_label.configure(image=self._frames[int(e * 14) % SPLASH_FRAMES])
+        label = [t for lim, t in self.STATUS if p >= lim][-1]
+        dots = "." * (int(e * 3) % 4)
+        self.status.configure(text=f"{label}{dots}")
+        a = min(1.0, e / 0.35, max(0.0, (self.DURATION - e) / 0.35))
+        try:
+            self.attributes("-alpha", max(0.0, a))
+        except Exception:
+            pass
+        if p >= 1.0:
             self.destroy()
             self.on_done()
         else:
-            self.after(30, self.step)
+            self.after(33, self.step)
 
 
 ensure_firebase_config()
