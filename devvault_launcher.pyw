@@ -30,7 +30,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFilter
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 BASE = Path(__file__).parent
 # Dauerhafter Datenordner (unabhängig davon, wo die .pyw liegt oder ob sie ersetzt wird)
 if os.name == "nt":
@@ -1842,6 +1842,59 @@ def apply_update(info):
     return install_update(data, info)
 
 
+def format_size(n):
+    if n is None:
+        return "unbekannt"
+    if n < 1024:
+        return f"{n} Byte"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.0f} KB"
+    if n < 1024 ** 3:
+        return f"{n / 1024 ** 2:.1f} MB".replace(".", ",")
+    return f"{n / 1024 ** 3:.2f} GB".replace(".", ",")
+
+
+def pending_update(result):
+    """Gibt die Update-Infos zurück, wenn in Firebase eine neuere Version steht, sonst None."""
+    if not result:
+        return None
+    ok, data, _ = result
+    if not ok or not isinstance(data, dict):
+        return None
+    latest = str(data.get("version", ""))
+    return data if latest and parse_version(latest) > parse_version(APP_VERSION) else None
+
+
+def remote_size(url):
+    """Dateigröße des Updates (aus dem Header, ohne die Datei zu laden)."""
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "DevVaultLauncher"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            return int(r.headers.get("Content-Length") or 0) or None
+    except Exception:
+        return None
+
+
+def download_with_progress(url, state):
+    """Lädt die Update-Datei; state['done'] und state['total'] zeigen den Fortschritt."""
+    if not str(url).startswith("https://"):
+        raise ValueError("Die Update-Adresse fehlt oder ist ungültig.")
+    req = urllib.request.Request(url, headers={"User-Agent": "DevVaultLauncher"})
+    chunks, done = [], 0
+    with urllib.request.urlopen(req, timeout=30) as r:
+        state["total"] = int(r.headers.get("Content-Length") or 0)
+        while True:
+            c = r.read(16384)
+            if not c:
+                break
+            chunks.append(c)
+            done += len(c)
+            state["done"] = done
+            if done > 5_000_000:
+                raise ValueError("Die Update-Datei ist unerwartet groß.")
+    return b"".join(chunks)
+
+
 def visible_cloud_items(items):
     """Alle Erweiterungen außer gesperrten (blocked), neueste zuerst."""
     out = [(c, m) for c, m in items.items()
@@ -2065,7 +2118,9 @@ class App(ctk.CTk):
         self.show_official()
 
         self.withdraw()
-        Splash(self, lambda: (self.deiconify(), self.after(800, self.check_updates)))
+        self._upd_result = None
+        self.fetch_async("app", lambda r: setattr(self, "_upd_result", r), timeout=5)
+        Splash(self, self.after_splash)
         self.after(3200, self.check_own_uploads)
 
     def _cat_button(self, parent, text, cmd):
@@ -2415,23 +2470,19 @@ class App(ctk.CTk):
 
         self.fetch_async("app", done)
 
+    def after_splash(self, waited=0):
+        """Nach dem Ladebildschirm: Gibt es ein Update, startet der Launcher nicht, sondern zeigt das Update-Fenster."""
+        if self._upd_result is None and waited < 30:  # bis zu 3 Sekunden auf die Antwort warten
+            self.after(100, lambda: self.after_splash(waited + 1))
+            return
+        info = pending_update(self._upd_result)
+        if info:
+            UpdateWindow(self, info, mandatory=True)
+        else:
+            self.deiconify()
+
     def offer_update(self, info):
-        msg = f"Neue Version {info.get('version')} ist verfügbar (du hast {APP_VERSION})."
-        notes = str(info.get("notes", "")).strip()
-        if notes:
-            msg += f"\n\n{notes}"
-        if not messagebox.askyesno("Update verfügbar", msg + "\n\nJetzt aktualisieren?"):
-            return
-        try:
-            new = apply_update(info)
-        except Exception as e:
-            messagebox.showerror("Update fehlgeschlagen", f"{type(e).__name__}: {e}")
-            return
-        messagebox.showinfo("Fertig", f"Aktualisiert auf Version {new}. Der Launcher startet jetzt neu.")
-        try:
-            subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
-        finally:
-            self.destroy()
+        UpdateWindow(self, info, mandatory=False)
 
     def fetch_async(self, path, done, timeout=6):
         """Holt Daten im Hintergrund und ruft done((ok, daten, fehler)) im Hauptfenster auf."""
@@ -2608,7 +2659,7 @@ class Splash(ctk.CTkToplevel):
 
     W, H, DURATION = 520, 380, 2.4
     TRANSPARENT = "#010203"
-    STATUS = [(0.0, "Starte DevVault"), (0.4, "Lade Oberfläche"), (0.8, "Gleich geht's los")]
+    STATUS = [(0.0, "Starte DevVault"), (0.4, "Prüfe auf Updates"), (0.8, "Gleich geht's los")]
 
     def __init__(self, master, on_done):
         super().__init__(master, fg_color=self.TRANSPARENT)
@@ -2668,9 +2719,131 @@ class Splash(ctk.CTkToplevel):
             self.after(33, self.step)
 
 
+class UpdateWindow(ctk.CTkToplevel):
+    """Update-Fenster: zeigt Version und Größe; ein Klick auf 'Update starten' lädt und installiert."""
+
+    def __init__(self, app, info, mandatory):
+        super().__init__(app, fg_color=PANEL)
+        self.app, self.info, self.mandatory = app, info, mandatory
+        self.busy = False
+        self.size_box = {}
+        self.title("DevVault Launcher – Update")
+        apply_icon(self)
+        w, h = 480, 540
+        self.geometry(f"{w}x{h}+{(self.winfo_screenwidth() - w) // 2}+{(self.winfo_screenheight() - h) // 2}")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        try:
+            self.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        logo = Image.open(io.BytesIO(base64.b64decode("".join(LOGO_PNG_B64))))
+        self._logo = ctk.CTkImage(logo, size=(84, 84))
+        ctk.CTkLabel(self, text="", image=self._logo).pack(pady=(28, 6))
+        ctk.CTkLabel(self, text="Update erforderlich" if mandatory else "Update verfügbar",
+                     font=("Segoe UI", 26, "bold"), text_color=TEXT).pack()
+        ctk.CTkLabel(self, text="Es gibt eine neue Version vom DevVault Launcher.",
+                     font=("Segoe UI", 13), text_color=MUTED).pack(pady=(2, 16))
+
+        card = ctk.CTkFrame(self, fg_color=CARD, corner_radius=20)
+        card.pack(fill="x", padx=36)
+        ctk.CTkLabel(card, text=f"Version {APP_VERSION}   →   Version {info.get('version')}",
+                     font=("Segoe UI", 16, "bold"), text_color=TEXT).pack(pady=(16, 4))
+        self.size_label = ctk.CTkLabel(card, text="Größe: wird ermittelt …", font=("Segoe UI", 13), text_color=MUTED)
+        self.size_label.pack(pady=(0, 16))
+
+        notes = str(info.get("notes", "")).strip()
+        if notes:
+            ctk.CTkLabel(self, text=notes, font=("Segoe UI", 12), text_color=MUTED, wraplength=400,
+                         justify="center").pack(pady=(12, 0), padx=36)
+
+        self.bar = ctk.CTkProgressBar(self, width=400, height=10, corner_radius=5, progress_color=ACCENT, fg_color=CARD)
+        self.status = ctk.CTkLabel(self, text="", font=("Segoe UI", 12), text_color=MUTED, wraplength=400)
+
+        self.btn = ctk.CTkButton(self, text="Update starten", width=400, height=48, corner_radius=16, fg_color=ACCENT,
+                                 hover_color=ACCENT_HOVER, font=("Segoe UI", 15, "bold"), command=self.start)
+        self.btn.pack(side="bottom", pady=(0, 26))
+        self.cancel = ctk.CTkButton(self, text="Beenden" if mandatory else "Später", width=400, height=38,
+                                    corner_radius=14, fg_color=CARD, hover_color="#2a3045", text_color=MUTED,
+                                    font=("Segoe UI", 12), command=self.close)
+        self.cancel.pack(side="bottom", pady=(0, 8))
+        self.status.pack(side="bottom", pady=(0, 10))
+        self.bar.set(0)
+
+        threading.Thread(target=self._get_size, daemon=True).start()
+        self.after(200, self._poll_size)
+
+    def _get_size(self):
+        url = str(self.info.get("url", ""))
+        self.size_box["size"] = remote_size(url) if url.startswith("https://") else None
+        self.size_box["ready"] = True
+
+    def _poll_size(self):
+        if self.size_box.get("ready"):
+            self.size_label.configure(text=f"Größe: {format_size(self.size_box.get('size'))}")
+        else:
+            self.after(200, self._poll_size)
+
+    def close(self):
+        if self.busy:
+            return
+        if self.mandatory:
+            self.app.destroy()
+        else:
+            self.destroy()
+
+    def start(self):
+        self.busy = True
+        self.btn.configure(state="disabled", text="Lade Update …")
+        self.cancel.configure(state="disabled")
+        self.status.configure(text="", text_color=MUTED)
+        self.bar.pack(side="bottom", pady=(0, 6), after=self.status)
+        self.bar.set(0)
+        st = self.state = {"done": 0, "total": 0, "finished": False, "error": None, "new": None}
+
+        def run():
+            try:
+                data = download_with_progress(str(self.info.get("url", "")), st)
+                st["new"] = install_update(data, self.info)
+            except Exception as e:
+                st["error"] = f"{type(e).__name__}: {e}"
+            st["finished"] = True
+
+        threading.Thread(target=run, daemon=True).start()
+        self._poll()
+
+    def _poll(self):
+        st = self.state
+        total = st["total"] or self.size_box.get("size") or 0
+        if total:
+            self.bar.set(min(st["done"] / total, 1))
+            self.status.configure(text=f"{format_size(st['done'])} von {format_size(total)}")
+        else:
+            self.status.configure(text=f"{format_size(st['done'])} geladen")
+        if not st["finished"]:
+            self.after(100, self._poll)
+            return
+        self.busy = False
+        if st["error"]:
+            self.status.configure(text=f"Update fehlgeschlagen: {st['error']}", text_color=WARN_FG)
+            self.btn.configure(state="normal", text="Erneut versuchen")
+            self.cancel.configure(state="normal")
+            return
+        self.bar.set(1)
+        self.btn.configure(text="Fertig")
+        self.status.configure(text=f"Aktualisiert auf Version {st['new']}. Der Launcher startet neu …", text_color="#50c88c")
+        self.after(1400, self._restart)
+
+    def _restart(self):
+        try:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
+        finally:
+            self.app.destroy()
+
+
 ensure_firebase_config()
 
 
 if __name__ == "__main__":
     App().mainloop()
-
